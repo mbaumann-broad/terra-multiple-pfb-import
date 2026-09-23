@@ -20,7 +20,7 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
-terra-import-prototype = "terra-import-prototype.cli:app"
+terra-import-prototype = "terra_import_prototype.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]

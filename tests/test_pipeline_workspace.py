@@ -684,7 +684,7 @@ def test_the_tail_reports_one_verdict_covering_jobs_and_data(monkeypatch, tmp_pa
     assert summary["total_rows"] == 7 and summary["table_count"] == 1
     assert summary["qc_passed"] is True
     assert summary["kind"] == "manifest"
-    assert summary["dispatch_policy"] == "parallel-cap3"
+    assert summary["dispatch_policy"] == "parallel-max_worker3"
     assert len(summary["job_ids"]) == 3
 
 

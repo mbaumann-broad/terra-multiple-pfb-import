@@ -223,3 +223,33 @@ config/config.yaml
 
 #har
 *.har
+
+# --- Project-specific ---
+# Local working area for HTTP captures (HAR), scratch files, etc. These can contain
+# live credentials/secrets and must never be committed.
+tmp/
+
+# Batch-run manifests (qc-batch-runner input TSVs). In flux during early testing: track the
+# directory (via its .gitkeep) but ignore its contents for now; revisit once the patterns stabilize.
+input/batch_manifests/*
+!input/batch_manifests/.gitkeep
+
+# Per-developer config (emails, ADC paths, billing projects) — never commit. Ignore every config
+# file except the committed example/template, so no local config (config.yaml, config2.yaml, …)
+# can be added accidentally.
+config/*.yaml
+!config/config.example.yaml
+
+# Local secrets: Azul access tokens, etc. — never commit.
+secrets/
+
+# Run logs.
+logs/
+
+# Editor / OS files.
+.DS_Store
+.idea/
+
+# Personal BBEdit Shell Worksheets — a maintainer's local scratch area for manual/interactive runs
+# (single-user for now; revisit if the team wants to share worksheets).
+worksheets/
