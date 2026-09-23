@@ -39,8 +39,11 @@ The pre-signed URL is a **secret** — it grants direct read of the exported dat
 environment over an interactive shell, where `--url` lands in shell history and the process list:
 
 ```bash
+# activate virtual environment
+source .venv/bin/activate
+
 # one PFB
-terra-import-prototype import-qc --url-file ./export-url.txt --tier dev
+terra-import-prototype import-qc --url-file ./export-url.txt --tier dev # or prod
 
 # a manifest: N import jobs into one workspace, three in flight at a time
 export TERRA_IMPORT_QC_URL='https://…/manifest.json?X-Amz-…'

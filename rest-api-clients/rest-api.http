@@ -37,7 +37,6 @@ Content-Type: application/x-www-form-urlencoded
 }
 
 > {%
-    // This extracts the token from the response and saves it globally
     client.global.set("uid", response.body.uid);
 %}
 
