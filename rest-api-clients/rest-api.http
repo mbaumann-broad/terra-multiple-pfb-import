@@ -1,0 +1,50 @@
+POST https://staging.gen3.biodatacatalyst.nhlbi.nih.gov/user/credentials/api/access_token
+Content-Type: application/json
+
+{
+  "api_key": "{{api_key}}"
+}
+
+> {%
+    // This extracts the token from the response and saves it globally
+    client.global.set("auth_token", response.body.access_token);
+%}
+
+### Get Data Libary List
+
+GET https://staging.gen3.biodatacatalyst.nhlbi.nih.gov/library/lists
+Authorization: Bearer {{auth_token}}
+Accept: application/json
+
+### Get Job List
+
+GET https://qa-dcp.planx-pla.net/sower/list
+Authorization: Bearer {{auth_token}}
+accept: application/json
+
+### POST Import Job
+
+POST https://qa-dcp.planx-pla.net/sower/dispatch?action=string&input=%7B%7D
+Authorization: Bearer {{auth_token}}
+accept: application/json
+Content-Type: application/x-www-form-urlencoded
+
+{
+  "action": "export-user-data-library",
+  "input": {
+    "list_id": "<list_id>"
+  }
+}
+
+> {%
+    // This extracts the token from the response and saves it globally
+    client.global.set("uid", response.body.uid);
+%}
+
+### GET Import Job Status
+
+GET https://qa-dcp.planx-pla.net/sower/status?UID={{uid}}
+Authorization: Bearer {{auth_token}}
+accept: application/json
+
+###

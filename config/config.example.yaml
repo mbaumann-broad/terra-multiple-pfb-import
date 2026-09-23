@@ -1,0 +1,52 @@
+# terra-import-prototype configuration — EXAMPLE / TEMPLATE.
+#
+# Copy this to config/config.yaml (which is gitignored) and fill in your own values:
+#     cp config/config.example.yaml config/config.yaml
+#
+# Only per-developer settings live here. The shared, non-secret service URLs are baked into the
+# package (see src/terra-import-prototype/config.py, mirroring docs/services.md), so you do not list them.
+#
+# The pre-signed Gen3 export URL is NOT configured here. It is a per-run secret and is passed at run
+# time via --url, --url-file, or the terra-import-prototype_URL environment variable.
+
+default_tier: dev
+
+tiers:
+  dev:
+    # The human Terra user account for the DEV tier. Enforced at runtime by the identity guard, which
+    # resolves the active credentials to their Terra user via Sam (/api/users/v2/self) — so in a Terra
+    # workflow the runtime pet service account maps back to this human account. Use the human account
+    # in every context (local and deployment), NOT a pet service account.
+    email: you@test.firecloud.org
+    # Optional: ADDITIONAL human Terra users authorized to run this tier (multi-operator). The
+    # identity guard allows any account in {email} ∪ authorized_users.
+    # authorized_users:
+    #   - teammate@broadinstitute.org
+    # Saved ADC credentials for this tier. Create with:
+    #   gcloud auth application-default login        # signed in as the dev account
+    # then copy ~/.config/gcloud/application_default_credentials.json to this path.
+    # Omit (or set null) to use the ambient runtime identity.
+    adc_credentials_file: ~/.config/terra-import-prototype/adc-dev.json
+    # Terra billing project = the workspace namespace runs create their workspace under.
+    terra_billing_project: your-dev-billing-project
+    # The workspace (inside terra_billing_project) that every run imports into. It is REUSED across
+    # runs -- see docs/import_flow.md step 2:
+    #   absent           -> created
+    #   exists, empty    -> adopted as-is
+    #   exists, has data -> DELETED and re-created, so the run starts from a known-empty workspace
+    # That delete is real and takes the workspace's bucket with it. Point this at a workspace you own
+    # and are willing to have emptied -- never at one holding anything you want to keep.
+    # Legal characters are letters, digits, '_' and '-'.
+    # Omit the key entirely to fall back to the legacy behaviour: a new, generated, per-run workspace
+    # name (which accumulates workspaces you must clean up yourself).
+    default_workspace_name: your_dev_import_workspace
+
+  prod:
+    # Runs against api.firecloud.org — the host in recorded.har. A prod run imports real BDC export
+    # data into a real Terra workspace; treat every run as potentially controlled-access.
+    email: you@example.org
+    adc_credentials_file: ~/.config/terra-import-prototype/adc-prod.json
+    terra_billing_project: your-prod-billing-project
+    # Re-read the delete warning above before setting this on prod: a non-empty workspace here is
+    # deleted and re-created, and on prod its contents are real data.
+    default_workspace_name: your_prod_import_workspace

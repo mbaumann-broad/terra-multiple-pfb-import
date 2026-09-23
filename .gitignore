@@ -1,0 +1,29 @@
+.venv/
+.venv1/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Per-developer config: Terra identity, ADC path, billing project. The committed template is
+# config/config.example.yaml.
+config/config.yaml
+
+# Detailed run logs. Redacted, but they name workspaces, jobIds and export paths.
+logs/
+
+# HAR captures. `recorded.har` is committed deliberately as the reference of record; any OTHER
+# capture is unscrubbed by default and carries bearer tokens and signed URLs. Scrub one with
+# scripts/scrub_har.py before committing it.
+*.har
+!recorded.har
+
+# The pre-signed export URL is a secret; --url-file points at one of these.
+*url*.txt
+secrets/
+**.env.json
