@@ -1,3 +1,5 @@
+![Unit Tests](https://github.com/mbaumann-broad/terra-multiple-pfb-import/actions/workflows/ci.yml/badge.svg)
+
 # terra-import-prototype
 
 Import a pre-signed **Gen3 BioData Catalyst** PFB export into a fresh Terra workspace and verify the
