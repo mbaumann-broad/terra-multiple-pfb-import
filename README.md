@@ -44,10 +44,21 @@ environment over an interactive shell, where `--url` lands in shell history and 
 # activate virtual environment
 source .venv/bin/activate
 
-# one PFB
+# one PFB URL
+# Steps to get URL 
+# 1. Sign into https://gen3.biodatacatalyst.nhlbi.nih.gov/ (assuming prod) 
+# 2. Explore a dataset to be exported
+# 3. export to Terra
+# 4. This will redirect to https://terra.biodatacatalyst.nhlbi.nih.gov/
+# 5. Copy the contents of the url after `url=`
+# 6. On a terminal use the following commands:
+#    alias urldecode='python3 -c "import sys, urllib.parse as ul; print(ul.unquote_plus(sys.argv[1]))"'
+#    urldecode {decoded url} > {directory of this project}/export-url.txt
 terra-import-prototype import-qc --url-file ./export-url.txt --tier prod # dev or prod
 
 # a manifest: N import jobs into one workspace, three in flight at a time
+# Get this from running ./rest-api-clients/rest-api.http
+# Use
 export TERRA_IMPORT_QC_URL='https://…/manifest.json?X-Amz-…'
 terra-import-prototype import-qc --kind manifest --dispatch parallel --max_worker 3 --tier dev
 
