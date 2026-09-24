@@ -116,7 +116,7 @@ def build_request(
     _validate(urls, source_label, allowed_host_patterns=allowed_host_patterns, max_urls=max_urls)
     return ImportRequest(kind=kind, source=signed_url, urls=tuple(urls), raw=raw)
 
-
+# TODO Eugene Need to check this will extract the Avro URLs correctly
 def _extract_urls(raw: Any, source: SignedUrl) -> list[str]:
     """Normalise every manifest shape the Terra UI accepts into a flat URL list.
 

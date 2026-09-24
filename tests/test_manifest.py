@@ -14,7 +14,9 @@ import pytest
 
 from terra_import_prototype.manifest import (
     DEFAULT_ALLOWED_HOST_PATTERNS,
+    MAX_URLS,
     ImportRequestError,
+    _extract_urls,
     build_request,
     infer_kind,
 )
@@ -251,3 +253,134 @@ def test_an_off_list_manifest_url_is_never_even_fetched():
         build_request(off_list, tier_name="dev", allowed_prefixes=PREFIXES, session=session)
 
     assert session.calls == [], "an off-list URL must not be dereferenced"
+
+
+# --- manifest normalisation (_extract_urls, directly) ------------------------
+#
+# build_request covers these shapes end-to-end above, but only for the ones that survive validation.
+# _extract_urls is tested directly as well because it is the port of terra-ui's normalisation and its
+# job is to be *permissive in the same ways the UI is* -- key precedence, the bare-list forms, an
+# empty result rather than a raise -- none of which is observable through build_request, which
+# rejects the empty and mixed cases before they are returned.
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"urls": [pfb(1), pfb(2)]},
+        {"files": [pfb(1), pfb(2)]},
+        {"sources": [pfb(1), pfb(2)]},
+        {"pfbs": [pfb(1), pfb(2)]},
+        [pfb(1), pfb(2)],
+        [{"url": pfb(1)}, {"url": pfb(2)}],
+        {"urls": [{"url": pfb(1)}, pfb(2)]},
+    ],
+    ids=["urls", "files", "sources", "pfbs", "bare-list", "list-of-objects", "mixed-entries"],
+)
+def test_extract_urls_flattens_every_accepted_shape(raw):
+    """Strings and ``{"url": ...}`` objects are interchangeable, under any of the four list keys or
+    at the root. The result is always a flat list of raw strings, in manifest order."""
+    assert _extract_urls(raw, MANIFEST) == [pfb(1), pfb(2)]
+
+
+def test_extract_urls_accepts_the_single_file_shape_gen3_emits():
+    """``{"url": ...}`` with no list key at all: the object *is* the one entry."""
+    assert _extract_urls({"url": pfb(1)}, MANIFEST) == [pfb(1)]
+
+
+def test_extract_urls_prefers_the_first_key_it_recognises():
+    """Key precedence is urls > files > sources > pfbs, and a recognised list key wins over a
+    sibling top-level 'url'. Pinned because a manifest carrying two of them must normalise the same
+    way here as in the UI, not the way dict ordering happens to fall."""
+    raw = {"urls": [pfb(1)], "files": [pfb(2)], "sources": [pfb(3)], "url": pfb(4)}
+    assert _extract_urls(raw, MANIFEST) == [pfb(1)]
+
+    assert _extract_urls({"files": [pfb(2)], "pfbs": [pfb(3)]}, MANIFEST) == [pfb(2)]
+
+
+def test_extract_urls_preserves_order_and_duplicates():
+    """Normalisation does not dedupe or sort -- _validate is what rejects duplicates, and it can
+    only report them if they survive to here."""
+    raw = {"urls": [pfb(2), pfb(1), pfb(2)]}
+    assert _extract_urls(raw, MANIFEST) == [pfb(2), pfb(1), pfb(2)]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [{}, [], {"urls": []}, {"other": "field"}],
+    ids=["empty-object", "empty-list", "empty-url-list", "no-recognised-key"],
+)
+def test_extract_urls_returns_empty_rather_than_raising(raw):
+    """An empty result is a *validation* failure, not a parse failure: _validate turns it into the
+    'yielded no URLs' message alongside any other problems, so the operator gets one round-trip."""
+    assert _extract_urls(raw, MANIFEST) == []
+
+
+@pytest.mark.parametrize(
+    "raw, expected_type",
+    [("a string", "str"), (7, "int"), (None, "NoneType"), (True, "bool")],
+    ids=["str", "int", "null", "bool"],
+)
+def test_extract_urls_rejects_a_root_that_is_neither_object_nor_list(raw, expected_type):
+    with pytest.raises(ImportRequestError) as excinfo:
+        _extract_urls(raw, MANIFEST)
+    message = str(excinfo.value)
+    assert "root must be an object or a list" in message
+    assert expected_type in message
+
+
+@pytest.mark.parametrize(
+    "raw, expected_type",
+    [({"urls": "not-a-list"}, "str"), ({"files": {"url": pfb(1)}}, "dict"), ({"pfbs": 3}, "int")],
+    ids=["string", "object", "int"],
+)
+def test_extract_urls_rejects_a_recognised_key_that_is_not_a_list(raw, expected_type):
+    """``{"urls": "<one url>"}`` is a shape the UI does not accept either. Naming the type it got is
+    what lets the operator fix the manifest without a second run."""
+    with pytest.raises(ImportRequestError) as excinfo:
+        _extract_urls(raw, MANIFEST)
+    message = str(excinfo.value)
+    assert "expected a list of URLs" in message
+    assert expected_type in message
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"not_a_url": f"{BUCKET}/secret.avro?X-Amz-Signature=leak"},
+        {"url": None},
+        {"url": 7},
+        {"url": [f"{BUCKET}/secret.avro?X-Amz-Signature=leak"]},
+        [f"{BUCKET}/secret.avro?X-Amz-Signature=leak"],
+        None,
+        7,
+    ],
+    ids=["wrong-key", "null-url", "int-url", "list-url", "list-entry", "null-entry", "int-entry"],
+)
+def test_extract_urls_rejects_an_entry_without_a_url_string_without_echoing_it(entry):
+    """A 'url' that is not a string is as unusable as a missing one -- and a malformed manifest can
+    still carry signed URLs, so the error names the index and never quotes the entry back."""
+    with pytest.raises(ImportRequestError) as excinfo:
+        _extract_urls({"urls": [pfb(1), entry]}, MANIFEST)
+    message = str(excinfo.value)
+    assert "entry 1 has no 'url' string" in message
+    assert "X-Amz-Signature" not in message
+
+
+def test_extract_urls_errors_name_the_manifest_by_location_not_by_signed_url():
+    """Every message in this function interpolates ``source``; ``.location`` is the redacted form,
+    and getting that wrong would put a signed URL into an exception that the CLI prints."""
+    with pytest.raises(ImportRequestError) as excinfo:
+        _extract_urls("nope", MANIFEST)
+    message = str(excinfo.value)
+    assert MANIFEST.location in message
+    assert "X-Amz-Signature" not in message
+
+
+def test_extract_urls_does_not_validate_hosts_or_count():
+    """Normalisation is only normalisation. The host allow-list, the fan-out cap and provenance are
+    _validate's and safety's jobs; doing any of them here would split the gate across two places and
+    let one drift."""
+    off_list = ["https://attacker.example.com/export.avro", "ftp://nope/b.avro"]
+    assert _extract_urls({"urls": off_list}, MANIFEST) == off_list
+    assert len(_extract_urls([pfb(i) for i in range(MAX_URLS + 5)], MANIFEST)) == MAX_URLS + 5

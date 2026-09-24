@@ -19,10 +19,9 @@ from terra_import_prototype.workspace import (
 
 WHEN = datetime(2026, 9, 21, 16, 51)
 
-
 def test_the_name_carries_user_shape_label_and_minute():
-    name = workspace_name("koon@broadinstitute.org", "export_1.avro", WHEN, infix=AVRO_NAME_INFIX)
-    assert name == "koon_qc_bdc_avro_export_1_avro_202609211651"
+    name = workspace_name("user@broadinstitute.org", "export_1.avro", WHEN, infix=AVRO_NAME_INFIX)
+    assert name == "user_qc_bdc_avro_export_1_avro_202609211651"
 
 
 def test_the_infix_says_which_import_shape_produced_the_workspace():

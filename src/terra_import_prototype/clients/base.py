@@ -24,6 +24,21 @@ from ..safety import BearerDestinationError
 
 logger = logging.getLogger(LOGGER_NAME)
 
+#: Cap on a logged error body. Terra error payloads are short; a truncated giant HTML proxy page is
+#: still enough to recognise, and the log stays readable.
+MAX_ERROR_BODY_CHARS = 2000
+
+
+def _error_body(resp: requests.Response) -> str:
+    """The response body of a failed call, as text, for logging. Never raises."""
+    try:
+        text = resp.text or "<empty body>"
+    except (requests.exceptions.RequestException, UnicodeDecodeError):
+        # A body that cannot be read or decoded must not mask the HTTP error it belongs to --
+        # the status is the finding; the body is only the explanation.
+        return "<unreadable body>"
+    return text[:MAX_ERROR_BODY_CHARS] + ("..." if len(text) > MAX_ERROR_BODY_CHARS else "")
+
 
 class BaseClient:
     """A thin wrapper over ``requests`` that injects a bearer token and logs every call.
@@ -108,6 +123,19 @@ class BaseClient:
         logger.debug(
             "  -> %s %s%s", resp.status_code, resp.reason or "", f"  {corr}" if corr else ""
         )
+        # An error *body* is the only place Terra says why it refused -- Rawls's "invalid billing
+        # project", Orchestration's rejected importJob. Logging just the status throws that away and
+        # leaves an operator guessing at the one artifact this tool exists to produce. Logged at
+        # ERROR (not DEBUG) so it survives a default-verbosity run, and redacted like any other body.
+        if resp.status_code >= 400:
+            logger.error(
+                "  -> %s %s for %s %s: %s",
+                resp.status_code,
+                resp.reason or "",
+                method,
+                redact_text(url),
+                redact_text(_error_body(resp)),
+            )
         if raise_for_status:
             resp.raise_for_status()
         return resp
