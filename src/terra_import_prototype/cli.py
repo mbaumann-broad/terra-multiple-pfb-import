@@ -5,18 +5,24 @@ terra-import-prototype import-qc --url <pre-signed URL> [--kind avro|manifest] [
     [--dry-run] [--verify-auth] [--config path]
 terra-import-prototype check-workspace --workspace-namespace <ns> --workspace-name <name> [--tier ...]
 
+``import-qc`` takes one or more pre-signed URLs and imports them all into **one** fresh workspace:
+every source is expanded, and the combined list of PFB URLs fans out into that single workspace. Two
+Avro URLs and a manifest naming two PFBs are the same thing to this tool -- one workspace, one
+fan-out, one verdict. A single URL is the one-element case, so there is no separate single-URL path.
+
 The signed URL is a secret: it grants direct read of the exported study data. Prefer
-``--url-file <path>`` (or ``TERRA_IMPORT_QC_URL`` in the environment) over ``--url`` on an
+``--url-files <path>`` (or ``TERRA_IMPORT_QC_URL`` in the environment) over ``--url`` on an
 interactive shell, where the value lands in shell history and in the process list. The tool itself
 never logs it -- see ``safety.SignedUrl``.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import typer
 
@@ -28,7 +34,7 @@ from .pipeline import (
     JOB_TIMEOUT_SECONDS,
     POLL_INTERVAL_SECONDS,
     run_check_workspace,
-    run_import_qc,
+    run_import_job,
 )
 from .safety import SafetyError
 
@@ -53,24 +59,72 @@ def main() -> None:
     """Terra PFB import QC commands."""
 
 
-def _resolve_url(url: Optional[str], url_file: Optional[Path]) -> str:
-    """Take the signed URL from exactly one of --url, --url-file, or the environment."""
-    sources = [
-        ("--url", url),
-        ("--url-file", url_file.read_text().strip() if url_file else None),
-        (URL_ENV_VAR, os.environ.get(URL_ENV_VAR)),
-    ]
-    supplied = [(name, value) for name, value in sources if value]
-    if not supplied:
+def _read_url_file(path: Path) -> str:
+    """Read one pre-signed URL from a file. The file holds the URL and nothing else."""
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise typer.BadParameter(f"--url-files: could not read {path}: {exc}") from exc
+    url = text.strip()
+    if not url:
+        raise typer.BadParameter(f"--url-files: {path} is empty; it must hold one pre-signed URL.")
+    return url
+
+
+def _url_file_paths(values: Sequence[str]) -> list[Path]:
+    """Expand the ``--url-files`` values into file paths.
+
+    Two spellings, both accepted, because both are natural to type:
+
+      --url-files='["./a.txt","./b.txt"]'     one JSON list
+      --url-files ./a.txt --url-files ./b.txt  the flag repeated
+
+    The values are **paths**, never the URLs themselves -- that is the whole point of the flag: the
+    signed URL stays out of shell history and the process list.
+    """
+    paths: list[Path] = []
+    for value in values:
+        entry = value.strip()
+        if not entry:
+            continue
+        if not entry.startswith("["):
+            paths.append(Path(entry))
+            continue
+        try:
+            parsed = json.loads(entry)
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(
+                f"--url-files: {entry!r} looks like a JSON list but does not parse: {exc}"
+            ) from exc
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            raise typer.BadParameter(
+                '--url-files: expected a JSON list of file paths, e.g. \'["./a.txt","./b.txt"]\'.'
+            )
+        paths.extend(Path(item.strip()) for item in parsed if item.strip())
+    return paths
+
+
+def _resolve_urls(url: Optional[str], url_files: Optional[Sequence[str]]) -> list[str]:
+    """Collect the run's pre-signed URLs from --url, --url-files, and the environment.
+
+    ``--url`` and ``--url-files`` are both explicit operator intent, so they add up: the run imports
+    every URL that was named. ``TERRA_IMPORT_QC_URL`` is a **fallback**, used only when neither flag
+    was passed -- an exported URL left over in a shell must never silently join a run that named its
+    own, because in this tool a stray extra URL is a stray extra import of controlled-access data.
+    """
+    urls: list[str] = [url] if url else []
+    urls.extend(_read_url_file(path) for path in _url_file_paths(url_files or []))
+
+    if not urls:
+        env_url = (os.environ.get(URL_ENV_VAR) or "").strip()
+        if env_url:
+            urls.append(env_url)
+
+    if not urls:
         raise typer.BadParameter(
-            f"No pre-signed URL supplied. Pass --url, --url-file, or set {URL_ENV_VAR}."
+            f"No pre-signed URL supplied. Pass --url, --url-files, or set {URL_ENV_VAR}."
         )
-    if len(supplied) > 1:
-        raise typer.BadParameter(
-            f"The pre-signed URL was supplied more than once ({', '.join(n for n, _ in supplied)}); "
-            "pass it exactly once so there is no doubt which one ran."
-        )
-    return supplied[0][1]
+    return urls
 
 
 def _policy(dispatch: str, max_worker: int) -> DispatchPolicy:
@@ -90,10 +144,12 @@ def import_qc(
     url: Optional[str] = typer.Option(
         None, "--url", "-u", help="The pre-signed Gen3 export URL (PFB .avro or manifest .json)."
     ),
-    url_file: Optional[Path] = typer.Option(
+    url_files: Optional[list[str]] = typer.Option(
         None,
-        "--url-file",
-        help="Read the pre-signed URL from this file instead (keeps it out of shell history).",
+        "--url-files",
+        help="Read the pre-signed URLs from files instead (keeps them out of shell history). "
+        'Either a JSON list -- --url-files=\'["./a.txt","./b.txt"]\' -- or the flag repeated. '
+        "Each file holds one URL, and every URL is imported into the same one workspace.",
     ),
     kind: Optional[str] = typer.Option(
         None,
@@ -140,18 +196,18 @@ def import_qc(
         help="Auth preflight: run the identity guard and exit. Fetches nothing, creates nothing.",
     ),
 ) -> None:
-    """Import a pre-signed Gen3 export into a fresh Terra workspace, then check the workspace."""
+    """Import the pre-signed Gen3 export(s) into one fresh Terra workspace, then check it."""
     if poll_strategy not in ("per_job", "list"):
         raise typer.BadParameter(f"Unknown --poll-strategy {poll_strategy!r} (expected per_job|list).")
     if kind is not None and kind not in ("avro", "manifest"):
         raise typer.BadParameter(f"Unknown --kind {kind!r} (expected avro|manifest).")
 
-    resolved_url = _resolve_url(url, url_file)
+    resolved_urls = _resolve_urls(url, url_files)
     policy = _policy(dispatch, max_worker)
 
     try:
-        result = run_import_qc(
-            resolved_url,
+        result = run_import_job(
+            resolved_urls,
             tier,
             config,
             kind=kind,  # type: ignore[arg-type]

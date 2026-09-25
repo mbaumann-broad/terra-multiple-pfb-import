@@ -12,6 +12,7 @@ from datetime import datetime
 from terra_import_prototype.workspace import (
     AVRO_NAME_INFIX,
     MANIFEST_NAME_INFIX,
+    MULTI_NAME_INFIX,
     infix_for,
     sanitize,
     workspace_name,
@@ -29,10 +30,13 @@ def test_the_infix_says_which_import_shape_produced_the_workspace():
     apart without opening them."""
     assert infix_for("avro") == AVRO_NAME_INFIX
     assert infix_for("manifest") == MANIFEST_NAME_INFIX
+    assert infix_for("multi") == MULTI_NAME_INFIX
 
     avro = workspace_name("k@b.org", "x.avro", WHEN, infix=infix_for("avro"))
     manifest = workspace_name("k@b.org", "x.json", WHEN, infix=infix_for("manifest"))
-    assert "bdc_avro" in avro and "bdc_manifest" in manifest
+    multi = workspace_name("k@b.org", "x.avro", WHEN, infix=infix_for("multi"))
+    assert "bdc_avro" in avro and "bdc_manifest" in manifest and "bdc_multi" in multi
+    assert len({avro, manifest, multi}) == 3, "each shape is tellable apart at a glance"
 
 
 def test_runs_a_minute_apart_do_not_collide():

@@ -1,8 +1,12 @@
-"""Turn the operator's one signed URL into the list of PFB URLs to import.
+"""Turn the operator's signed URL(s) into the list of PFB URLs to import.
 
 Two input shapes, one result. A signed **Avro** URL is the request; a signed **manifest** URL is
 fetched and expands to N of them. Both produce an :class:`ImportRequest`, so everything downstream --
 provenance checks, fan-out, polling, QC -- is the same code for both.
+
+An operator may supply several signed URLs at once. :func:`build_run` builds each one independently
+and then checks them as a whole, because they all import into **one** workspace: the fan-out's width
+and its duplicate URLs are properties of the run, not of any single source.
 
 The validation here is a faithful port of terra-ui's ``useImportRequest.getImportRequest`` and the
 client-side host allow-list, not a convenience wrapper: a URL this module accepts must be one the
@@ -15,13 +19,13 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from urllib.parse import urlsplit
 
 import requests
 
 from .logging_setup import LOGGER_NAME
-from .models import ImportRequest, RequestKind
+from .models import ImportRequest, ImportRun, RequestKind
 from .safety import SignedUrl, assert_uniform_provenance, fetch_signed_json
 
 logger = logging.getLogger(LOGGER_NAME)
@@ -115,6 +119,94 @@ def build_request(
 
     _validate(urls, source_label, allowed_host_patterns=allowed_host_patterns, max_urls=max_urls)
     return ImportRequest(kind=kind, source=signed_url, urls=tuple(urls), raw=raw)
+
+
+def build_run(
+    signed_urls: Sequence[SignedUrl],
+    *,
+    kind: Optional[RequestKind] = None,
+    tier_name: str,
+    allowed_prefixes: tuple[str, ...],
+    allowed_host_patterns: tuple[str, ...] = DEFAULT_ALLOWED_HOST_PATTERNS,
+    max_urls: int = MAX_URLS,
+    session: Optional[requests.Session] = None,
+) -> ImportRun:
+    """Build the whole run -- one or N operator-supplied signed URLs, all bound for one workspace.
+
+    Each URL goes through :func:`build_request` on its own (so a manifest is still fetched, expanded
+    and provenance-checked exactly as before), and then the merged result is checked as a whole by
+    :func:`_validate_run`. ``kind`` applies to **every** URL given: it overrides the per-URL extension
+    guess, so a run of mixed shapes must let the extensions speak for themselves.
+
+    Nothing is dispatched until every source and the run as a whole pass, so a bad URL anywhere in
+    the list creates *zero* jobs rather than importing the first two and failing on the third -- the
+    same reason a bad manifest entry rejects the whole manifest.
+    """
+    if not signed_urls:
+        raise ImportRequestError("No signed URL to import.")
+
+    run = ImportRun(
+        tuple(
+            build_request(
+                signed_url,
+                kind=kind,
+                tier_name=tier_name,
+                allowed_prefixes=allowed_prefixes,
+                allowed_host_patterns=allowed_host_patterns,
+                max_urls=max_urls,
+                session=session,
+            )
+            for signed_url in signed_urls
+        )
+    )
+    _validate_run(run, max_urls=max_urls)
+    if len(run.requests) > 1:
+        logger.info(
+            "Run: %d source(s) expanded to %d PFB URL(s), all importing into one workspace.",
+            len(run.requests),
+            len(run.urls),
+        )
+    return run
+
+
+def _validate_run(run: ImportRun, *, max_urls: int) -> None:
+    """Check the merged run, after every source has already been checked on its own.
+
+    Two things only become checkable once the sources are merged, and both matter precisely *because*
+    everything now lands in one workspace:
+
+    1. **Total fan-out width.** ``MAX_URLS`` bounds one fan-out, and the run is one fan-out. Checking
+       it per source would let four 40-URL manifests become a 160-way fan-out into cWDS.
+    2. **Duplicates across sources.** Two manifests naming the same PFB, or the same file passed
+       twice, would import it twice into the same entity tables. Within one source that is already a
+       rejection (see :func:`_validate`); across sources it has the same effect and the same cause --
+       an operator listing something twice.
+
+    Compared on :class:`SignedUrl` identity, which is value equality on the full URL, so no signed
+    URL is unwrapped here.
+    """
+    errors: list[str] = []
+
+    if len(run.urls) > max_urls:
+        errors.append(
+            f"{len(run.requests)} source(s) yielded {len(run.urls)} URLs in total, over the "
+            f"self-imposed limit of {max_urls} for one fan-out (see manifest.MAX_URLS)"
+        )
+
+    seen: set[SignedUrl] = set()
+    for request in run.requests:
+        for url in request.urls:
+            if url in seen:
+                errors.append(
+                    f"duplicate URL across sources: {url.filename} (from {request.source.filename})"
+                )
+            seen.add(url)
+
+    if errors:
+        raise ImportRequestError(
+            f"This run is not importable ({len(errors)} problem(s)):\n  - " + "\n  - ".join(errors)
+        )
+
 
 # TODO Eugene Need to check this will extract the Avro URLs correctly
 def _extract_urls(raw: Any, source: SignedUrl) -> list[str]:

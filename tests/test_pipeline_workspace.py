@@ -35,6 +35,7 @@ from terra_import_prototype.models import (
     TIMEOUT,
     DispatchPolicy,
     ImportRequest,
+    ImportRun,
     is_terminal,
 )
 from terra_import_prototype.pipeline import (
@@ -328,6 +329,46 @@ def test_every_url_gets_its_own_submit_and_its_own_job_id(count):
     assert result.all_succeeded
 
 
+class IdlessFirecloud(FakeFirecloud):
+    """Orchestration returning a 202 with no ``jobId`` -- a protocol violation, not a rejection."""
+
+    def submit_import_job(self, namespace, name, signed_url, *, filetype="pfb", options=None):
+        response = super().submit_import_job(
+            namespace, name, signed_url, filetype=filetype, options=options
+        )
+        return {"url": response["url"]}
+
+
+def test_an_idless_submit_response_gets_a_random_job_id_instead_of_taking_the_run_down():
+    """Every job is keyed by its jobId, so two idless jobs sharing ``None`` would erase each other
+    from the report -- and raising would discard the siblings that did get ids."""
+    firecloud = IdlessFirecloud(SERVICE_URLS["dev"]["firecloud"])
+    result = run(firecloud, URLS[:3])
+
+    assert len(result.jobs) == 3, "no job was lost"
+    assert len({job.job_id for job in result.jobs}) == 3, "each stand-in id is distinct"
+    assert all(pipeline.is_synthetic_job_id(job.job_id) for job in result.jobs)
+
+
+def test_a_job_we_invented_an_id_for_is_reported_failed_not_left_to_time_out():
+    """The id is ours, so Orchestration 404s it forever. Waiting out the full per-job budget would
+    hold a pool slot for a job that can never be tracked."""
+    firecloud = IdlessFirecloud(SERVICE_URLS["dev"]["firecloud"])
+    result = run(firecloud, URLS[:1], job_timeout_s=10**6)
+
+    job = result.jobs[0]
+    assert job.status == "Error" and not job.succeeded
+    assert job.status != TIMEOUT, "failed on the first poll, not after the budget"
+    assert "jobId" in (job.message or "")
+
+
+def test_a_real_job_id_is_never_mistaken_for_a_synthetic_one():
+    firecloud = fc()
+    result = run(firecloud, URLS[:2])
+
+    assert not any(pipeline.is_synthetic_job_id(job.job_id) for job in result.jobs)
+
+
 def test_every_submit_targets_the_same_workspace():
     """N jobs, one workspace. A fan-out that spread across workspaces would 'pass' every per-job
     check while producing exactly the wrong end state."""
@@ -566,6 +607,16 @@ def _request(urls, kind="manifest"):
     return ImportRequest(kind=kind, source=source, urls=tuple(urls))
 
 
+def _run(urls, kind="manifest"):
+    """A one-source run -- the degenerate case of the N-source run the tail actually takes."""
+    return ImportRun((_request(urls, kind),))
+
+
+def _multi_run(*requests):
+    """A run the operator built by passing several signed URLs at once."""
+    return ImportRun(tuple(requests))
+
+
 def test_handoff_is_verified_for_every_url_not_just_the_first():
     """A manifest's N URLs are N separate deliveries of a credential to Terra. Verifying only the
     first would leave N-1 unverified -- so one bad URL must stop the whole request."""
@@ -577,7 +628,7 @@ def test_handoff_is_verified_for_every_url_not_just_the_first():
             firecloud,
             NS,
             WS,
-            _request([URLS[0], URLS[1], smuggled]),
+            _run([URLS[0], URLS[1], smuggled]),
             tier_name="dev",
             policy=DispatchPolicy(mode="parallel", max_worker=3),
         )
@@ -595,7 +646,7 @@ def test_handoff_refuses_a_destination_that_is_not_the_tier_firecloud_host():
             wrong_host,
             NS,
             WS,
-            _request(URLS[:2]),
+            _run(URLS[:2]),
             tier_name="dev",
             policy=DispatchPolicy(mode="parallel", max_worker=3),
         )
@@ -609,7 +660,7 @@ def test_submit_import_jobs_fans_out_when_the_handoff_passes():
         firecloud,
         NS,
         WS,
-        _request(URLS[:3]),
+        _run(URLS[:3]),
         tier_name="dev",
         policy=DispatchPolicy(mode="parallel", max_worker=3),
         poll_interval_s=0,
@@ -651,21 +702,28 @@ def run_tail(monkeypatch, tmp_path, request_obj, *, entities, firecloud=None, ra
     rawls = rawls or FakeRawls(entities=entities)
     monkeypatch.setattr(pipeline, "RawlsClient", lambda *a, **k: rawls)
     monkeypatch.setattr(pipeline, "FirecloudClient", lambda *a, **k: firecloud)
-    summary = pipeline._create_import_and_qc(
-        setup=_setup(tmp_path),
+    setup = _setup(tmp_path)
+    durations: dict = {}
+    ws_name = pipeline._create_terra_workspace(
+        request=request_obj, durations=durations, setup=setup, rawls=rawls
+    )
+    summary = pipeline._create_import_submit(
+        setup=setup,
         request=request_obj,
         policy=DispatchPolicy(mode="parallel", max_worker=3),
         poll_strategy="per_job",
         poll_interval_s=0,
         job_timeout_s=60,
-        durations={},
+        durations=durations,
+        ws_name=ws_name,
+        rawls=rawls,
     )
     return summary, firecloud, rawls
 
 
 def test_the_tail_creates_one_workspace_and_fans_every_url_into_it(monkeypatch, tmp_path):
     summary, firecloud, rawls = run_tail(
-        monkeypatch, tmp_path, _request(URLS[:3]), entities={"subject": {"count": 7}}
+        monkeypatch, tmp_path, _run(URLS[:3]), entities={"subject": {"count": 7}}
     )
 
     assert rawls.create_calls == 1, "one workspace per run, however wide the fan-out"
@@ -677,7 +735,7 @@ def test_the_tail_creates_one_workspace_and_fans_every_url_into_it(monkeypatch, 
 
 def test_the_tail_reports_one_verdict_covering_jobs_and_data(monkeypatch, tmp_path):
     summary, _fc, _rawls = run_tail(
-        monkeypatch, tmp_path, _request(URLS[:3]), entities={"subject": {"count": 7}}
+        monkeypatch, tmp_path, _run(URLS[:3]), entities={"subject": {"count": 7}}
     )
 
     assert summary["job_count"] == 3 and summary["jobs_succeeded"] == 3
@@ -690,7 +748,7 @@ def test_the_tail_reports_one_verdict_covering_jobs_and_data(monkeypatch, tmp_pa
 
 def test_the_tail_fails_the_verdict_when_the_workspace_stays_empty(monkeypatch, tmp_path):
     """Every job says Done and nothing arrived -- the failure mode the data check exists for."""
-    summary, _fc, _rawls = run_tail(monkeypatch, tmp_path, _request(URLS[:2]), entities={})
+    summary, _fc, _rawls = run_tail(monkeypatch, tmp_path, _run(URLS[:2]), entities={})
 
     assert summary["jobs_succeeded"] == 2
     assert summary["total_rows"] == 0
@@ -702,7 +760,7 @@ def test_the_tail_still_reports_when_part_of_the_fan_out_failed(monkeypatch, tmp
     summary, _fc, _rawls = run_tail(
         monkeypatch,
         tmp_path,
-        _request(URLS[:3]),
+        _run(URLS[:3]),
         entities={"subject": {"count": 4}},
         firecloud=fc(reject={URLS[1].reveal()}),
     )
@@ -715,10 +773,10 @@ def test_the_tail_still_reports_when_part_of_the_fan_out_failed(monkeypatch, tmp
 def test_the_avro_and_manifest_shapes_take_the_same_tail(monkeypatch, tmp_path):
     """Only the workspace-name infix distinguishes them -- the wiring is identical."""
     avro, _fc, _rawls = run_tail(
-        monkeypatch, tmp_path, _request(URLS[:1], kind="avro"), entities={"subject": {"count": 1}}
+        monkeypatch, tmp_path, _run(URLS[:1], kind="avro"), entities={"subject": {"count": 1}}
     )
     manifest, _fc2, _rawls2 = run_tail(
-        monkeypatch, tmp_path, _request(URLS[:1]), entities={"subject": {"count": 1}}
+        monkeypatch, tmp_path, _run(URLS[:1]), entities={"subject": {"count": 1}}
     )
 
     assert avro["job_count"] == manifest["job_count"] == 1
@@ -727,10 +785,87 @@ def test_the_avro_and_manifest_shapes_take_the_same_tail(monkeypatch, tmp_path):
     assert "bdc_manifest" in manifest["workspace_name"]
 
 
+def test_several_sources_all_land_in_one_workspace(monkeypatch, tmp_path):
+    """The point of the change: N operator-supplied URLs are N sources, not N workspaces.
+
+    Three sources expanding to four PFBs must produce one createWorkspace and four importJobs into
+    that same workspace -- what this tool exists to study is many PFBs landing in one workspace, and
+    splitting them across workspaces would measure something else.
+    """
+    run_obj = _multi_run(
+        _request(URLS[:2]),                      # a manifest naming two
+        _request(URLS[2:3], kind="avro"),        # a single Avro URL
+        _request(URLS[3:4], kind="avro"),        # another single Avro URL
+    )
+    summary, firecloud, rawls = run_tail(
+        monkeypatch, tmp_path, run_obj, entities={"subject": {"count": 9}}
+    )
+
+    assert rawls.create_calls == 1, "one workspace for the whole run, not one per source"
+    assert len(firecloud.submitted) == 4, "every URL from every source was submitted"
+    assert {(s[0], s[1]) for s in firecloud.submitted} == {("proj", summary["workspace_name"])}
+    assert summary["job_count"] == 4 and summary["jobs_succeeded"] == 4
+    assert summary["source_count"] == 3
+    assert summary["qc_passed"] is True
+
+
+def test_a_multi_source_run_is_named_as_its_own_shape(monkeypatch, tmp_path):
+    """A workspace fed by three sources must not read as a single-PFB import in a list of results."""
+    single, _fc, _rawls = run_tail(
+        monkeypatch, tmp_path, _run(URLS[:1], kind="avro"), entities={"subject": {"count": 1}}
+    )
+    multi, _fc2, _rawls2 = run_tail(
+        monkeypatch,
+        tmp_path,
+        _multi_run(_request(URLS[:1], kind="avro"), _request(URLS[1:2], kind="avro")),
+        entities={"subject": {"count": 2}},
+    )
+
+    assert "bdc_avro" in single["workspace_name"] and single["kind"] == "avro"
+    assert "bdc_multi" in multi["workspace_name"] and multi["kind"] == "multi"
+
+
+def test_one_source_and_one_manifest_of_the_same_width_take_the_same_path(monkeypatch, tmp_path):
+    """Three URLs from one manifest and three given directly are the same fan-out downstream."""
+    from_manifest, fc_a, _ra = run_tail(
+        monkeypatch, tmp_path, _run(URLS[:3]), entities={"subject": {"count": 3}}
+    )
+    from_sources, fc_b, _rb = run_tail(
+        monkeypatch,
+        tmp_path,
+        _multi_run(*(_request(URLS[i : i + 1], kind="avro") for i in range(3))),
+        entities={"subject": {"count": 3}},
+    )
+
+    assert len(fc_a.submitted) == len(fc_b.submitted) == 3
+    assert sorted(s[2] for s in fc_a.submitted) == sorted(s[2] for s in fc_b.submitted)
+    for summary in (from_manifest, from_sources):
+        assert summary["job_count"] == 3 and summary["qc_passed"] is True
+
+
+def test_the_handoff_is_verified_for_every_url_of_every_source():
+    """Per-URL verification must not become per-*source* verification when sources are merged: a
+    smuggled URL in the third source is still N-1 verified deliveries and one unverified one."""
+    firecloud = fc()
+    smuggled = SignedUrl("https://evil.example.com/export.avro?X-Amz-Signature=deadbeef")
+
+    with pytest.raises(SignedUrlProvenanceError):
+        submit_import_jobs(
+            firecloud,
+            NS,
+            WS,
+            _multi_run(_request(URLS[:2]), _request([smuggled], kind="avro")),
+            tier_name="dev",
+            policy=DispatchPolicy(mode="parallel", max_worker=3),
+        )
+
+    assert firecloud.submitted == [], "no job is created when any URL fails the check"
+
+
 def test_the_summary_carries_no_signed_url(monkeypatch, tmp_path):
     """It is returned to the CLI and printed, so it must be safe to paste into a ticket."""
     summary, _fc, _rawls = run_tail(
-        monkeypatch, tmp_path, _request(URLS[:2]), entities={"subject": {"count": 2}}
+        monkeypatch, tmp_path, _run(URLS[:2]), entities={"subject": {"count": 2}}
     )
 
     assert "X-Amz-Signature" not in repr(summary)

@@ -54,7 +54,11 @@ source .venv/bin/activate
 # 6. On a terminal use the following commands:
 #    alias urldecode='python3 -c "import sys, urllib.parse as ul; print(ul.unquote_plus(sys.argv[1]))"'
 #    urldecode {decoded url} > {directory of this project}/export-url.txt
-terra-import-prototype import-qc --url-file ./export-url.txt --tier prod # dev or prod
+terra-import-prototype import-qc --url-files ./export-url.txt --tier prod # dev or prod
+
+# several PFB URLs: each file holds one URL, and they ALL import into ONE workspace --
+# the same fan-out a manifest naming the same PFBs would produce.
+terra-import-prototype import-qc --url-files='["./export-url.txt","./export-url-2.txt"]' --tier prod
 
 # a manifest: N import jobs into one workspace, three in flight at a time
 # Get this from running ./rest-api-clients/rest-api.http
@@ -63,8 +67,8 @@ export TERRA_IMPORT_QC_URL='https://…/manifest.json?X-Amz-…'
 terra-import-prototype import-qc --kind manifest --dispatch parallel --max_worker 3 --tier dev
 
 # check everything without creating anything
-terra-import-prototype import-qc --url-file ./url.txt --verify-auth   # identity only
-terra-import-prototype import-qc --url-file ./url.txt --dry-run       # + fetch and validate the manifest
+terra-import-prototype import-qc --url-files ./url.txt --verify-auth   # identity only
+terra-import-prototype import-qc --url-files ./url.txt --dry-run       # + fetch and validate the manifest
 
 # re-check a workspace a previous run left behind
 terra-import-prototype check-workspace --workspace-namespace <ns> --workspace-name <name>
@@ -74,6 +78,7 @@ Useful flags:
 
 | Flag | Why |
 |---|---|
+| `--url`, `--url-files` | the pre-signed URL(s). `--url-files` names **files** holding the URLs (one per file) — as a JSON list or by repeating the flag — so they stay out of shell history. The two add up; `TERRA_IMPORT_QC_URL` applies only when neither is passed. However many URLs are given, they import into **one** workspace |
 | `--kind avro\|manifest` | override the extension-based guess |
 | `--dispatch parallel\|sequential\|sequential-await`, `--max_worker N` | pace the fan-out; the max_worker bounds **jobs in flight**, not POSTs |
 | `--poll-strategy per_job\|list` | `per_job` mirrors today's UI; `list` is one request covering every job |

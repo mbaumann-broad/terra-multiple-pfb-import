@@ -60,6 +60,11 @@ def is_failure(status: str) -> bool:
 #: that expands to N PFB URLs.
 RequestKind = Literal["avro", "manifest"]
 
+#: The shape of a whole **run**, which is what the workspace name records. ``avro`` and ``manifest``
+#: are the single-source shapes above; ``multi`` is N operator-supplied sources merged into one
+#: workspace. See :class:`ImportRun`.
+RunShape = Literal["avro", "manifest", "multi"]
+
 
 @dataclass(frozen=True)
 class ImportRequest:
@@ -92,6 +97,76 @@ class ImportRequest:
         if self.kind == "avro":
             return f"1 PFB from {self.source.filename}"
         return f"{len(self.urls)} PFB(s) from manifest {self.source.filename}"
+
+
+@dataclass(frozen=True)
+class ImportRun:
+    """Everything one invocation imports, and the single workspace it all goes into.
+
+    The operator may supply N signed URLs. Each expands to its own :class:`ImportRequest` -- one PFB,
+    or a manifest's worth of them -- and the run concatenates those into **one** list of PFB URLs
+    fanned out into **one** workspace. N sources do **not** mean N workspaces: the point of this tool
+    is what happens when many PFBs land in the same workspace, and splitting them across workspaces
+    would be measuring a different thing entirely.
+
+    A one-source run is the degenerate case of that, so there is no single-source code path that can
+    drift from the N-source one -- the same reason a single Avro URL is a one-element fan-out.
+
+    Deliberately exposes the same ``kind`` / ``source`` / ``urls`` / ``description`` surface as
+    :class:`ImportRequest`: the tail (workspace naming, hand-off verification, fan-out, QC, summary)
+    is written against that surface and does not care how many sources it started from.
+    """
+
+    requests: tuple[ImportRequest, ...]
+
+    def __post_init__(self) -> None:
+        if not self.requests:
+            raise ValueError("An import run needs at least one source URL.")
+
+    def __len__(self) -> int:
+        return len(self.urls)
+
+    @property
+    def urls(self) -> tuple[SignedUrl, ...]:
+        """Every PFB URL this run imports, in the order the sources were given.
+
+        This is the fan-out: one ``importJob`` per entry, all into the one workspace.
+        """
+        return tuple(url for request in self.requests for url in request.urls)
+
+    @property
+    def sources(self) -> tuple[SignedUrl, ...]:
+        """The operator's original signed URLs, one per ``--url``/``--url-files`` entry."""
+        return tuple(request.source for request in self.requests)
+
+    @property
+    def source(self) -> SignedUrl:
+        """The source that names the run -- its log file and its workspace label."""
+        return self.requests[0].source
+
+    @property
+    def kind(self) -> RunShape:
+        """The run's shape, which the workspace-name infix is derived from.
+
+        Several sources are their own shape (``multi``) rather than being reported as whichever kind
+        the first one happened to be: a workspace fed by three sources is not a single-PFB import and
+        should not be mistaken for one in a list of result workspaces.
+        """
+        return self.requests[0].kind if len(self.requests) == 1 else "multi"
+
+    @property
+    def is_fan_out(self) -> bool:
+        return len(self.urls) > 1
+
+    @property
+    def description(self) -> str:
+        """A safe one-line summary for logs and the workspace description (no secrets)."""
+        if len(self.requests) == 1:
+            return self.requests[0].description
+        shown = ", ".join(source.filename for source in self.sources[:5])
+        if len(self.requests) > 5:
+            shown += f", +{len(self.requests) - 5} more"
+        return f"{len(self.urls)} PFB(s) from {len(self.requests)} sources: {shown}"
 
 
 # --- jobs --------------------------------------------------------------------
