@@ -22,6 +22,10 @@ _NON_NAME_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 #: Workspace-name infix per import shape (the leading ``qc`` keeps them grouped/identifiable).
 AVRO_NAME_INFIX = "qc_bdc_avro"
 MANIFEST_NAME_INFIX = "qc_bdc_manifest"
+#: Several operator-supplied sources merged into one workspace. Its own infix because a workspace
+#: fed by three sources is a different experiment from one fed by a single PFB or a single manifest,
+#: and telling them apart at a glance is the whole reason the infix exists.
+MULTI_NAME_INFIX = "qc_bdc_multi"
 
 #: Terra caps workspace names; keep the generated name comfortably inside it. The timestamp and
 #: infix are never truncated -- only the label is -- so uniqueness and identifiability survive.
@@ -33,9 +37,18 @@ def sanitize(text: str) -> str:
     return _NON_NAME_CHARS.sub("_", text).strip("_")
 
 
+#: Import shape -> infix. An unrecognised shape falls back to the manifest infix, which is the
+#: conservative reading: "more than one PFB may have landed here".
+_INFIX_BY_KIND = {
+    "avro": AVRO_NAME_INFIX,
+    "manifest": MANIFEST_NAME_INFIX,
+    "multi": MULTI_NAME_INFIX,
+}
+
+
 def infix_for(kind: str) -> str:
-    """The workspace-name infix for an import kind (``avro`` / ``manifest``)."""
-    return AVRO_NAME_INFIX if kind == "avro" else MANIFEST_NAME_INFIX
+    """The workspace-name infix for an import shape (``avro`` / ``manifest`` / ``multi``)."""
+    return _INFIX_BY_KIND.get(kind, MANIFEST_NAME_INFIX)
 
 
 def workspace_name(

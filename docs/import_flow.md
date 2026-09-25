@@ -23,15 +23,40 @@ study.
 A one-entry manifest and a bare Avro URL produce an identical `importJob`. There is deliberately no
 single-file code path.
 
+### …and one more axis: several sources
+
+The operator may hand the tool **several** signed URLs at once (`--url-files`), each of either shape.
+They are not several runs. Every source is expanded and the results are concatenated into one list of
+PFB URLs (`models.ImportRun`), and **one** workspace is created for the lot:
+
+| Input | Sources | `importJob` calls | Workspaces |
+|---|---|---|---|
+| one `.avro` | 1 | 1 | 1 |
+| one `manifest.json` naming 3 | 1 | 3 | 1 |
+| three `.avro` URLs | 3 | 3 | **1** |
+| a manifest naming 2, plus one `.avro` | 2 | 3 | **1** |
+
+Downstream, a manifest naming three PFBs and three URLs given directly are the same three-way
+fan-out into the same workspace — which is the point, since what is under study is what happens when
+many PFBs land in *one* workspace. The only thing that records how the run was assembled is the
+workspace-name infix (`qc_bdc_avro` / `qc_bdc_manifest` / `qc_bdc_multi`) and `source_count` in the
+summary.
+
+Two checks only become possible once the sources are merged, and `manifest.build_run` does both
+before anything is created: the **total** fan-out width against `MAX_URLS` (the run is one fan-out,
+so four 40-URL manifests must not become a 160-way one), and **duplicate URLs across sources**, which
+would otherwise import the same PFB twice into the same entity tables.
+
 ![flowchart.png](../images/flowchart.png)
 
 ```mermaid
 flowchart LR
-  G[Gen3 BDC export<br/>pre-signed URL] --> B{kind?}
+  G[Gen3 BDC export<br/>1..N pre-signed URLs] --> B{kind? per source}
   B -- .avro --> R[1 URL]
   B -- .json --> F[fetch manifest] --> R2[N URLs]
-  R --> WS{configured workspace<br/>exists?}
-  R2 --> WS
+  R --> M[merge sources<br/>ImportRun]
+  R2 --> M
+  M --> WS{configured workspace<br/>exists?}
   WS -- no --> C[Rawls createWorkspace]
   WS -- yes --> E{empty?}
   E -- yes --> C2[adopt as-is]

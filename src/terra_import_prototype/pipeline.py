@@ -7,10 +7,17 @@ One flow, two input shapes (``docs/import_flow.md``):
 - **manifest** — the operator holds one pre-signed manifest URL naming N PFB URLs. **N**
   ``importJob`` calls into the same workspace.
 
-Both run the same tail (:func:`_create_import_and_qc`): Rawls createWorkspace
-(``authorizationDomain: []``) -> fan out ``firecloud.submit_import_job`` -> poll every job to a
-terminal status -> QC (the workspace holds data). A single Avro import is the degenerate one-element
-fan-out, so there is no single-file code path that could drift from the N-file one.
+Both run the same tail (:func:`_create_terra_workspace` then :func:`_create_import_submit`): Rawls
+createWorkspace (``authorizationDomain: []``) -> fan out ``firecloud.submit_import_job`` -> poll every
+job to a terminal status -> QC (the workspace holds data). A single Avro import is the degenerate
+one-element fan-out, so there is no single-file code path that could drift from the N-file one.
+
+:func:`run_import_job` takes **one or N** signed URLs and runs that tail **once**: every source is
+expanded, the results are concatenated into one list of PFB URLs (:class:`models.ImportRun`), one
+workspace is created, and the whole list fans out into it. N sources are not N runs and not N
+workspaces -- a manifest naming five PFBs and five Avro URLs given on the command line produce the
+same five-job fan-out into the same single workspace, which is the point: what this tool studies is
+what happens when many PFBs land in one workspace.
 
 **The fan-out is the thing under test.** Terra's UI does not import a manifest; it expands the
 manifest client-side and posts one ``importJob`` per URL, then polls each jobId. That means N
@@ -29,6 +36,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,13 +52,13 @@ from .clients.firecloud import FirecloudClient, JobNotFound, OrchError, import_j
 from .clients.rawls import RawlsClient, workspace_auth_domains
 from .config import SERVICE_URLS, ResolvedTier, load_config, resolve_tier
 from .logging_setup import LOGGER_NAME, setup_logging, write_header
-from .manifest import build_request
+from .manifest import build_run
 from .models import (
     TIMEOUT,
     BatchResult,
     DispatchPolicy,
     ImportJob,
-    ImportRequest,
+    ImportRun,
     RequestKind,
     StatusSample,
     is_terminal,
@@ -101,9 +109,46 @@ JOB_TIMEOUT_SECONDS = 7200.0
 PollStrategy = Literal["per_job", "list"]
 
 
+#: Prefix on a jobId this tool invented because the 202 carried none. Orchestration's ids are UUIDs
+#: with no prefix, so a prefixed id can never collide with a real one -- and anything downstream can
+#: tell "a job we cannot track" from "a job we can".
+SYNTHETIC_JOB_ID_PREFIX = "local-"
+
+
 def _http_status(exc: requests.exceptions.HTTPError) -> Optional[int]:
     """The HTTP status code carried by a requests ``HTTPError``, or ``None`` if unavailable."""
     return getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def _synthetic_job_id() -> str:
+    """A locally-generated stand-in jobId. See :func:`_job_id_for`."""
+    return f"{SYNTHETIC_JOB_ID_PREFIX}{uuid.uuid4()}"
+
+
+def is_synthetic_job_id(job_id: Optional[str]) -> bool:
+    return bool(job_id) and job_id.startswith(SYNTHETIC_JOB_ID_PREFIX)
+
+
+def _job_id_for(response: dict, url: SignedUrl) -> str:
+    """The submit response's jobId, or a random stand-in when it carries none.
+
+    A 202 without a jobId is a protocol violation -- ``recorded.har`` shows Orchestration always
+    returns one -- but it must not take the run down. Every job is keyed by its jobId (dispatch
+    offsets, status history, the batch summary), so a job with no id would collide with every other
+    idless job and erase them from the report. A random id keeps this job distinct and visible;
+    ``is_synthetic_job_id`` marks it as one this tool cannot actually poll.
+    """
+    try:
+        return import_job_id(response)
+    except ValueError:
+        job_id = _synthetic_job_id()
+        logger.warning(
+            "Import submit for %s returned no jobId; tracking it locally as %s. It cannot be "
+            "polled, so it will be reported as failed.",
+            url.filename,
+            job_id,
+        )
+        return job_id
 
 
 # --- workspace creation ------------------------------------------------------
@@ -309,7 +354,9 @@ class ImportFanOut:
             return job
 
         status = to_status(response)
-        job.job_id = status.job_id or import_job_id(response)
+        # The jobId is the handle for everything that follows. If the 202 carried none, a random
+        # stand-in is used so this job stays distinct in the report rather than vanishing.
+        job.job_id = status.job_id or _job_id_for(response, url)
         # The 202 carries no status (recorded.har), so "Pending" is ours, not Orchestration's. A
         # job *can* already be terminal in the 202 -- a rejected URL fails before the first poll --
         # so a status that is present is kept.
@@ -427,6 +474,13 @@ class ImportFanOut:
         try:
             status = self._firecloud.get_import_job(self._namespace, self._name, job.job_id or "")
         except JobNotFound:
+            if is_synthetic_job_id(job.job_id):
+                # We invented this id; Orchestration will never know it, so waiting out the full
+                # per-job budget would only hold a pool slot for nothing.
+                job.status = "Error"
+                job.message = "submit response carried no jobId; the job cannot be tracked"
+                self._record(job, job.status)
+                return True
             self._record(job, job.status)
             return False
         self._apply(job, status.status, status.message)
@@ -483,7 +537,7 @@ def submit_import_jobs(
     firecloud: FirecloudClient,
     namespace: str,
     name: str,
-    request: ImportRequest,
+    request: ImportRun,
     *,
     tier_name: str,
     policy: DispatchPolicy,
@@ -493,10 +547,10 @@ def submit_import_jobs(
 ) -> tuple[ImportFanOut, list[ImportJob]]:
     """Verify each URL's hand-off, then fan out one ``submit_import_job`` per URL.
 
-    The hand-off check runs **per URL**, not once per run: a manifest's N URLs are N separate
-    deliveries of a credential to Terra, and verifying only the first would leave N-1 unverified. It
-    runs before any submit, so a manifest with one bad destination creates zero jobs rather than
-    failing partway.
+    The hand-off check runs **per URL** -- not once per run, and not once per source. Every URL the
+    run's sources expanded to is a separate delivery of a credential to Terra, so checking only the
+    first (of the run, or of each source) would leave the rest unverified. It runs before any submit,
+    so one bad destination anywhere in the run creates zero jobs rather than failing partway.
     """
     expected_host = urlsplit(SERVICE_URLS[tier_name]["firecloud"]).netloc
     destination_host = urlsplit(firecloud.base_url).netloc
@@ -572,52 +626,65 @@ def _setup_run(
 # --- the shared tail ---------------------------------------------------------
 
 
-def _create_import_and_qc(
+def _create_terra_workspace(
+    *,
+    request: ImportRun,
+    durations: dict[str, float],
+    setup: _RunSetup,
+    rawls: RawlsClient,
+) -> str:
+    """Create this import's destination workspace and return its name.
+
+    One workspace per import, however wide the fan-out that follows. The name is logged BEFORE the
+    import so the marker is present even if the import later fails -- the workspace is retained, and
+    it is where an operator goes to see what actually landed. ``namespace`` and ``name`` are both
+    ``[A-Za-z0-9_-]``, so the single ``/`` in the marker splits them cleanly.
+    """
+    ws_name = workspace_name(
+        setup.tier.email, request.source.filename, infix=infix_for(request.kind)
+    )
+    logger.info("Creating workspace %s/%s", setup.tier.terra_billing_project, ws_name)
+    try:
+        with stage_timer("workspace_create", durations):
+            _create_workspace_resilient(
+                rawls,
+                setup.tier.terra_billing_project,
+                ws_name,
+                description=f"terra-import-prototype {__version__}: {request.description}",
+            )
+        logger.info("Terra workspace: %s/%s", setup.tier.terra_billing_project, ws_name)
+    finally:
+        log_stage_summary(durations)
+
+    return ws_name
+
+
+def _create_import_submit(
     *,
     setup: _RunSetup,
-    request: ImportRequest,
+    request: ImportRun,
     policy: DispatchPolicy,
     poll_strategy: PollStrategy,
     poll_interval_s: float,
     job_timeout_s: float,
     durations: dict[str, float],
+    ws_name: str,
+    rawls: RawlsClient,
 ) -> dict:
-    """Create the workspace, fan the import out into it, wait for every job, then QC it.
-
-    Identical for both input shapes -- a one-URL request simply fans out to one job.
-    """
-    tier = setup.tier
+    """Fan the import out into ``ws_name``, wait for every job, then QC the workspace."""
     google_token = setup.google_token
-
-    ws_name = workspace_name(
-        tier.email, request.source.filename, infix=infix_for(request.kind)
-    )
-    rawls = RawlsClient(tier.url("rawls"), google_token, timeout=RAWLS_TIMEOUT)
-    logger.info("Creating workspace %s/%s", tier.terra_billing_project, ws_name)
     try:
-        with stage_timer("workspace_create", durations):
-            _create_workspace_resilient(
-                rawls,
-                tier.terra_billing_project,
-                ws_name,
-                description=f"terra-import-prototype {__version__}: {request.description}",
-            )
-        # Stable, greppable marker for the created workspace, logged BEFORE the import so it is
-        # present even if the import later fails -- the retained workspace still exists and is where
-        # an operator goes to see what actually landed. namespace and name are both [A-Za-z0-9_-],
-        # so the single '/' splits them cleanly.
-        logger.info("QC workspace: %s/%s", tier.terra_billing_project, ws_name)
-
         firecloud = FirecloudClient(
-            tier.url("firecloud"), google_token, timeout=FIRECLOUD_TIMEOUT
+            setup.tier.url("firecloud"), google_token, timeout=FIRECLOUD_TIMEOUT
         )
+
         with stage_timer("import_submit", durations):
             fanout, jobs = submit_import_jobs(
                 firecloud,
-                tier.terra_billing_project,
+                setup.tier.terra_billing_project,
                 ws_name,
                 request,
-                tier_name=tier.name,
+                tier_name=setup.tier.name,
                 policy=policy,
                 poll_strategy=poll_strategy,
                 poll_interval_s=poll_interval_s,
@@ -630,7 +697,7 @@ def _create_import_and_qc(
         with stage_timer("qc", durations):
             qc = run_qc(
                 rawls=rawls,
-                namespace=tier.terra_billing_project,
+                namespace=setup.tier.terra_billing_project,
                 workspace_name=ws_name,
                 batch=batch,
             )
@@ -638,7 +705,7 @@ def _create_import_and_qc(
         if not qc.passed:
             logger.warning(
                 "QC FAILED for %s/%s -- see the report above.",
-                tier.terra_billing_project,
+                setup.tier.terra_billing_project,
                 ws_name,
             )
         return _summary(setup, qc, request, policy, durations)
@@ -652,7 +719,7 @@ def _create_import_and_qc(
 def _summary(
     setup: _RunSetup,
     qc: QcResult,
-    request: ImportRequest,
+    request: ImportRun,
     policy: DispatchPolicy,
     durations: dict[str, float],
 ) -> dict:
@@ -662,6 +729,7 @@ def _summary(
         "workspace_name": qc.workspace_name,
         "kind": request.kind,
         "source": request.source.filename,
+        "source_count": len(request.requests),
         "job_count": len(qc.batch.jobs),
         "jobs_succeeded": len(qc.batch.succeeded),
         "job_ids": qc.batch.job_ids,
@@ -678,8 +746,8 @@ def _summary(
 # --- commands ----------------------------------------------------------------
 
 
-def run_import_qc(
-    url: str,
+def run_import_job(
+    urls: list[str],
     tier_name: Optional[str],
     config_path: Path,
     *,
@@ -692,35 +760,49 @@ def run_import_qc(
     dry_run: bool = False,
     verify_auth: bool = False,
 ) -> dict:
-    """Import a pre-signed Gen3 export into a fresh Terra workspace and check the result.
+    """Import the operator's pre-signed Gen3 export(s) into **one** fresh Terra workspace, then QC it.
 
-    ``url`` is the operator's pre-signed URL -- a PFB (``.avro``) or a manifest (``.json``); ``kind``
-    overrides the extension-based guess.
+    ``urls`` holds one or more signed URLs -- each a PFB (``.avro``) or a manifest (``.json``);
+    ``kind`` overrides the extension-based guess for all of them. Every source is expanded and the
+    results concatenated, so the run is always: **one** workspace, **one** fan-out over every PFB URL
+    the sources named between them, **one** verdict. One URL is the one-element case of that, and a
+    manifest that expands to N is indistinguishable downstream from N URLs given directly -- which is
+    what keeps the single-source path from drifting from the multi-source one.
+
+    Nothing is created until **every** source has been fetched, expanded and validated
+    (:func:`manifest.build_run`), so a bad URL anywhere in the list produces zero jobs and no
+    workspace rather than an import that got halfway.
 
     ``verify_auth`` is a side-effect-free preflight: run the identity guard and stop, before any
-    manifest fetch, workspace or import. ``dry_run`` (weaker) stops after the request is built and
-    validated -- so a manifest is fetched and every URL is checked, but no workspace is created and
+    manifest fetch, workspace or import. ``dry_run`` (weaker) stops after the run is built and
+    validated -- so every manifest is fetched and every URL checked, but no workspace is created and
     no job is submitted. Both exist because the expensive, state-creating part of this flow is the
     fan-out, and being able to check everything before it is worth a flag.
     """
+    if not urls:
+        raise ValueError("run_import_job needs at least one pre-signed URL.")
     policy = policy or DispatchPolicy()
-    signed_url = SignedUrl(url)
-    setup = _setup_run(signed_url.filename or "import", tier_name, config_path, log_dir)
+    signed_urls = [SignedUrl(url) for url in urls]
+
+    # The log file is named after the first source; the run's other sources are named in the header
+    # line build_run logs. Never the URL itself -- the query string is the secret.
+    setup = _setup_run(signed_urls[0].filename or "import", tier_name, config_path, log_dir)
     tier = setup.tier
 
     if verify_auth:
         logger.info(
             "--verify-auth OK: identity %s authorized for tier '%s'. No manifest fetched, no "
-            "workspace created, no import submitted.",
+            "workspace created, no import submitted (%d source URL(s) were not read).",
             setup.identity,
             tier.name,
+            len(signed_urls),
         )
         return {"verify_auth": True, "identity": setup.identity, "log_file": str(setup.log_file)}
 
     durations: dict[str, float] = {}
     with stage_timer("build_request", durations):
-        request = build_request(
-            signed_url,
+        request = build_run(
+            signed_urls,
             kind=kind,
             tier_name=tier.name,
             allowed_prefixes=SIGNED_URL_ALLOWED_PREFIXES.get(tier.name, ()),
@@ -729,7 +811,9 @@ def run_import_qc(
 
     if dry_run:
         logger.info(
-            "--dry-run: %d URL(s) validated; no workspace created and no import submitted.",
+            "--dry-run: %d source(s) validated, expanding to %d URL(s); no workspace created and no "
+            "import submitted.",
+            len(request.requests),
             len(request.urls),
         )
         log_stage_summary(durations)
@@ -737,12 +821,24 @@ def run_import_qc(
             "dry_run": True,
             "kind": request.kind,
             "source": request.source.filename,
+            "source_count": len(request.requests),
             "job_count": len(request.urls),
             "durations": durations,
             "log_file": str(setup.log_file),
         }
 
-    return _create_import_and_qc(
+    rawls = RawlsClient(tier.url("rawls"), setup.google_token, timeout=RAWLS_TIMEOUT)
+
+    # One workspace for the whole run...
+    ws_name = _create_terra_workspace(
+        request=request,
+        durations=durations,
+        setup=setup,
+        rawls=rawls,
+    )
+
+    # ...and every URL from every source fans out into that one workspace.
+    return _create_import_submit(
         setup=setup,
         request=request,
         policy=policy,
@@ -750,6 +846,8 @@ def run_import_qc(
         poll_interval_s=poll_interval_s,
         job_timeout_s=job_timeout_s,
         durations=durations,
+        ws_name=ws_name,
+        rawls=rawls,
     )
 
 

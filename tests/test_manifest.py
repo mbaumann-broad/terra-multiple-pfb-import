@@ -18,6 +18,7 @@ from terra_import_prototype.manifest import (
     ImportRequestError,
     _extract_urls,
     build_request,
+    build_run,
     infer_kind,
 )
 from terra_import_prototype.safety import SignedUrl, SignedUrlProvenanceError
@@ -384,3 +385,77 @@ def test_extract_urls_does_not_validate_hosts_or_count():
     off_list = ["https://attacker.example.com/export.avro", "ftp://nope/b.avro"]
     assert _extract_urls({"urls": off_list}, MANIFEST) == off_list
     assert len(_extract_urls([pfb(i) for i in range(MAX_URLS + 5)], MANIFEST)) == MAX_URLS + 5
+
+
+# --- the whole run: N sources, one workspace ---------------------------------
+#
+# Each source is still built and checked on its own (everything above). What is checked here is what
+# only exists once they are merged -- because they are merged into ONE fan-out into ONE workspace.
+
+
+def build_the_run(sources, payload=None, **kwargs):
+    kwargs.setdefault("tier_name", "dev")
+    kwargs.setdefault("allowed_prefixes", PREFIXES)
+    return build_run(sources, session=FakeSession(payload or {"urls": [pfb(1)]}), **kwargs)
+
+
+def test_one_source_is_the_degenerate_case_of_a_run():
+    run = build_the_run([AVRO])
+
+    assert len(run.requests) == 1
+    assert run.urls == (AVRO,)
+    assert run.kind == "avro", "a one-source run keeps the source's own shape"
+    assert run.source == AVRO
+
+
+def test_several_sources_concatenate_into_one_list_of_urls_to_fan_out():
+    run = build_the_run([AVRO, SignedUrl(pfb(2)), SignedUrl(pfb(3))])
+
+    assert [u.filename for u in run.urls] == [AVRO.filename, "export_2.avro", "export_3.avro"], (
+        "in the order the sources were given"
+    )
+    assert run.kind == "multi"
+    assert run.source == AVRO, "the first source names the run"
+
+
+def test_a_manifest_and_a_direct_url_merge_into_one_run():
+    """The two input shapes are not separate runs; they are sources of the same fan-out."""
+    run = build_the_run([MANIFEST, SignedUrl(pfb(9))], payload={"urls": [pfb(1), pfb(2)]})
+
+    assert len(run.urls) == 3 and len(run.requests) == 2
+    assert run.kind == "multi"
+
+
+def test_the_same_url_from_two_sources_is_refused():
+    """It would be imported twice into the same entity tables. Within one source this is already a
+    rejection; across sources it has the same cause -- an operator listing something twice."""
+    duplicate = SignedUrl(pfb(1))
+
+    with pytest.raises(ImportRequestError) as excinfo:
+        build_the_run([duplicate, SignedUrl(pfb(2)), duplicate])
+
+    message = str(excinfo.value)
+    assert "duplicate URL across sources" in message
+    assert "X-Amz-Signature" not in message, "the message names filenames, never a signed URL"
+
+
+def test_the_fan_out_cap_applies_to_the_run_not_to_each_source():
+    """MAX_URLS bounds one fan-out, and the run IS one fan-out. Checking it per source would let
+    four 40-URL manifests become a 160-way fan-out into cWDS."""
+    sources = [SignedUrl(pfb(i)) for i in range(10)]
+
+    with pytest.raises(ImportRequestError, match="over the self-imposed limit"):
+        build_the_run(sources, max_urls=5)
+
+    assert len(build_the_run(sources, max_urls=10).urls) == 10, "exactly at the cap is fine"
+
+
+def test_a_bad_source_anywhere_in_the_list_creates_no_run_at_all():
+    """Same rule as a bad manifest entry: zero jobs, not two imports and a failure on the third."""
+    with pytest.raises(ImportRequestError):
+        build_the_run([AVRO, SignedUrl(f"{BUCKET}/notes.txt?X-Amz-Signature=deadbeef")])
+
+
+def test_an_empty_source_list_is_refused():
+    with pytest.raises(ImportRequestError, match="No signed URL"):
+        build_the_run([])
